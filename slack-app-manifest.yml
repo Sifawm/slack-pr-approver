@@ -1,0 +1,14 @@
+# Pégalo en https://api.slack.com/apps → Create New App → From a manifest.
+display_information:
+  name: PR approver
+oauth_config:
+  scopes:
+    user:
+      - channels:history # leer canales públicos
+      - groups:history # leer canales privados
+      - reactions:write # reaccionar a las peticiones
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  # Tiene que quedarse en false: con rotación el token caduca a las 12h y el script deja de funcionar.
+  token_rotation_enabled: false

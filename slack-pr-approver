@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+# Approves, with your GitHub account, the PRs your team asks for in a Slack channel.
+# Meant to run from cron every minute. Config: ~/.config/slack-pr-approver/config (see
+# config.example). DRY_RUN=1 ignores the saved state, looks at the last 24h and only logs what it
+# would do: it neither approves nor reacts.
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/slack-pr-approver/config"
+TS_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/slack-pr-approver/last_ts"
+MAX_AGE=86400 # never look further back than 24h
+
+log() { echo "$(date '+%Y-%m-%dT%H:%M:%S%z') $*" >&2; }
+
+# Defaults; the config overrides them.
+WARN_REACTION=warning
+TOKEN_CMD='secret-tool lookup service slack-pr-approver'
+declare -A TEAM=()
+[[ -f $CONFIG ]] || { log "ERROR no config at $CONFIG"; exit 1; }
+# shellcheck source=config.example
+source "$CONFIG"
+for var in CHANNEL REPO TRIGGER REACTION; do
+  [[ -n ${!var:-} ]] || { log "ERROR $var is not set in $CONFIG"; exit 1; }
+done
+((${#TEAM[@]})) || { log "ERROR TEAM is empty in $CONFIG"; exit 1; }
+
+# cron has no session bus, and without it secret-tool can't reach the keyring.
+if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} && -S /run/user/$(id -u)/bus ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+fi
+
+TOKEN=$(eval "$TOKEN_CMD") && [[ -n $TOKEN ]] || { log "ERROR TOKEN_CMD returned no Slack token"; exit 1; }
+PR_LINK="github\.com/$REPO/pull/[0-9]+"
+
+slack() {
+  local method=$1 res
+  shift
+  # The token goes through a file descriptor so it never shows up in `ps`.
+  res=$(curl -sS --fail -H @<(printf 'Authorization: Bearer %s' "$TOKEN") "https://slack.com/api/$method" "$@")
+  if [[ $(jq -r .ok <<<"$res") != true ]]; then
+    log "ERROR slack $method: $(jq -r .error <<<"$res")"
+    return 1
+  fi
+  echo "$res"
+}
+
+react() {
+  [[ -z ${DRY_RUN:-} ]] || return 0
+  slack reactions.add -d channel="$CHANNEL" -d timestamp="$1" -d name="$2" >/dev/null || true
+}
+
+now=$(date +%s)
+if [[ -n ${DRY_RUN:-} ]]; then
+  oldest=$((now - MAX_AGE))
+elif [[ ! -f $TS_FILE ]]; then
+  mkdir -p "$(dirname "$TS_FILE")"
+  echo "$now" >"$TS_FILE"
+  log "first run: only messages from now on will count"
+  exit 0
+else
+  oldest=$(<"$TS_FILE")
+  if ((${oldest%.*} < now - MAX_AGE)); then oldest=$((now - MAX_AGE)); fi
+fi
+
+# A failed Slack call exits here, before last_ts moves, so the next run retries.
+msgs='[]'
+cursor=''
+while :; do
+  page=$(slack conversations.history --get -d channel="$CHANNEL" -d oldest="$oldest" -d limit=200 \
+    ${cursor:+--data-urlencode cursor="$cursor"})
+  msgs=$(jq -s '.[0] + .[1].messages' <<<"$msgs $page")
+  cursor=$(jq -r '.response_metadata.next_cursor // empty' <<<"$page")
+  [[ -n $cursor ]] || break
+done
+
+me=$(gh api user --jq .login)
+team_logins=" ${TEAM[*]} "
+
+# Top-level messages only: thread replies don't come back from conversations.history, and the
+# subtype filter drops broadcasts, joins and bot posts. An edit keeps the message's original ts,
+# so editing an old message to add the trigger never brings it back into the window.
+while IFS=$'\t' read -r -u 3 ts user text64; do
+  [[ -n ${DRY_RUN:-} ]] || echo "$ts" >"$TS_FILE"
+  [[ -n ${TEAM[$user]:-} ]] || continue
+  text=$(base64 -d <<<"$text64")
+  # Slack sends emojis in the text as :name:
+  grep -qiF ":$TRIGGER:" <<<"$text" || continue
+  prs=$(grep -oiE "$PR_LINK" <<<"$text" | grep -oE '[0-9]+$' | sort -u) || continue
+
+  approved='' warned=''
+  for n in $prs; do
+    if ! pr=$(gh pr view "$n" -R "$REPO" --json state,isDraft,author,latestReviews </dev/null); then
+      log "#$n (asked by ${TEAM[$user]}): gh pr view failed"
+      warned=1
+      continue
+    fi
+    reason=$(jq -r --arg me "$me" --arg team "$team_logins" '.author.login as $author
+      | if .state != "OPEN" then "state is \(.state)"
+      elif .isDraft then "draft"
+      elif $author == $me then "it is your own PR"
+      elif ($team | contains(" \($author) ") | not) then "author \($author) is not in the team"
+      elif any(.latestReviews[]; .author.login == $me and .state == "APPROVED") then "already approved"
+      else "" end' <<<"$pr")
+    case $reason in
+      "already approved")
+        log "#$n (asked by ${TEAM[$user]}): already approved"
+        approved=1 ;;
+      "")
+        if [[ -n ${DRY_RUN:-} ]]; then
+          log "#$n (asked by ${TEAM[$user]}): WOULD APPROVE"
+          approved=1
+        elif gh pr review "$n" -R "$REPO" --approve </dev/null >/dev/null; then
+          log "#$n (asked by ${TEAM[$user]}): APPROVED"
+          approved=1
+        else
+          log "#$n (asked by ${TEAM[$user]}): gh pr review failed"
+          warned=1
+        fi ;;
+      *)
+        log "#$n (asked by ${TEAM[$user]}): skipped, $reason"
+        warned=1 ;;
+    esac
+  done
+
+  [[ -z $approved ]] || react "$ts" "$REACTION"
+  [[ -z $warned ]] || react "$ts" "$WARN_REACTION"
+done 3< <(jq -r 'map(select(.subtype == null and .bot_id == null)) | sort_by(.ts | tonumber)[]
+  | [.ts, (.user // ""), (.text | @base64)] | @tsv' <<<"$msgs")

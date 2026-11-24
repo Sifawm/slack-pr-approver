@@ -1,0 +1,32 @@
+# Configuración de slack-pr-approver. Cópiala a ~/.config/slack-pr-approver/config y rellénala.
+# Es un fichero de bash: sin espacios alrededor del "=".
+
+# Canal de Slack donde se piden las aprobaciones. Su ID: abre el canal → su nombre arriba →
+# pestaña "Información", abajo del todo ("ID del canal", empieza por C).
+CHANNEL=C0123456789
+
+# Repo de GitHub cuyas PRs se aprueban, como owner/nombre.
+REPO=mi-org/mi-repo
+
+# Emoji que pide la aprobación cuando aparece en el texto del mensaje, sin los dos puntos.
+# Un mensaje con :aprobaditto: y un enlace a una PR de REPO cuenta como petición.
+TRIGGER=aprobaditto
+
+# Reacción que se pone en el mensaje cuando sus PRs quedan aprobadas (o ya lo estaban), sin los
+# dos puntos.
+REACTION=aprobaditto
+
+# Reacción cuando alguna PR del mensaje no se pudo aprobar. El motivo queda en el log.
+WARN_REACTION=warning
+
+# Comando que imprime el token de usuario de Slack (xoxp-...). Por defecto lo lee del keyring de
+# Linux. En macOS: TOKEN_CMD='security find-generic-password -s slack-pr-approver -w'
+TOKEN_CMD='secret-tool lookup service slack-pr-approver'
+
+# Quién puede pedir aprobaciones y de quién se aprueban las PRs: [ID de Slack]=login de GitHub.
+# ID de Slack: perfil de la persona → ⋮ → "Copiar ID de miembro" (empieza por U).
+# No te pongas a ti: GitHub no deja aprobar tus propias PRs.
+declare -A TEAM=(
+  [U0123456789]=alice-gh
+  [U9876543210]=bob-gh
+)
